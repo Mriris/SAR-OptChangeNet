@@ -9,39 +9,53 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
 # 导入自定义模块
-from model import TransformerChangeDetection
+from model import ImprovedTransformerChangeDetection
 from dataset import create_dataloaders
 
 
 # 损失函数
-class DistillationLoss(nn.Module):
-    def __init__(self, alpha=0.5, T=2.0):
-        super(DistillationLoss, self).__init__()
+class EnhancedLoss(nn.Module):
+    def __init__(self, alpha=0.5, T=2.0, focal_gamma=2.0, dice_weight=0.5):
+        super(EnhancedLoss, self).__init__()
         self.alpha = alpha
         self.T = T
-        self.bce_loss = nn.BCELoss()
+        self.focal_gamma = focal_gamma
+        self.dice_weight = dice_weight
         self.kl_loss = nn.KLDivLoss(reduction='batchmean')
 
+    def focal_loss(self, pred, target):
+        """Focal Loss - 更好地处理类别不平衡"""
+        bce = F.binary_cross_entropy(pred, target, reduction='none')
+        pt = target * pred + (1 - target) * (1 - pred)
+        focal_weight = (1 - pt) ** self.focal_gamma
+        return (focal_weight * bce).mean()
+
+    def dice_loss(self, pred, target, smooth=1.0):
+        """Dice Loss - 更好地关注区域重叠"""
+        pred_flat = pred.reshape(-1)
+        target_flat = target.reshape(-1)
+        intersection = (pred_flat * target_flat).sum()
+        return 1 - (2. * intersection + smooth) / (pred_flat.sum() + target_flat.sum() + smooth)
+
     def forward(self, outputs, targets, student_features, teacher_features):
-        # 二元交叉熵损失（主要任务损失）
-        bce = self.bce_loss(outputs, targets)
+        # 组合Focal和Dice损失
+        seg_loss = self.focal_loss(outputs, targets) * (1 - self.dice_weight) + \
+                   self.dice_loss(outputs, targets) * self.dice_weight
 
         # 知识蒸馏损失
-        # 将特征扁平化以计算KL散度
         bs, c, h, w = student_features.size()
         student_flat = student_features.view(bs, c, -1)
         teacher_flat = teacher_features.view(bs, c, -1)
 
-        # 应用温度缩放并计算KL散度
         student_log_softmax = F.log_softmax(student_flat / self.T, dim=2)
         teacher_softmax = F.softmax(teacher_flat / self.T, dim=2)
 
         distillation = self.kl_loss(student_log_softmax, teacher_softmax) * (self.T ** 2)
 
         # 总损失
-        loss = (1 - self.alpha) * bce + self.alpha * distillation
+        loss = (1 - self.alpha) * seg_loss + self.alpha * distillation
 
-        return loss, bce, distillation
+        return loss, seg_loss, distillation
 
 
 # 评估指标
@@ -68,7 +82,7 @@ def calculate_metrics(pred, target):
     }
 
 
-def train_one_epoch(model, dataloader, criterion, optimizer, device):
+def train_one_epoch(model, dataloader, criterion, optimizer, device, grad_clip_value):
     model.train()
     epoch_loss = 0
     epoch_bce_loss = 0
@@ -92,6 +106,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device):
         # 反向传播和优化
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_value)  # 使用传入的参数
         optimizer.step()
 
         # 记录损失和指标
@@ -115,6 +130,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device):
         metrics[k] /= len(dataloader)
 
     return epoch_loss, epoch_bce_loss, epoch_distill_loss, metrics
+
 
 
 def validate(model, dataloader, criterion, device):
@@ -170,17 +186,31 @@ def main(args):
     # 创建数据加载器 - 使用新函数，支持命令行参数优先
     train_loader, val_loader = create_dataloaders(args)
 
+    # 创建停止训练的参数
+    patience = 10
+    patience_counter = 0
+    best_val_loss = float('inf')
+
     # 创建模型
-    model = TransformerChangeDetection(
+    model = ImprovedTransformerChangeDetection(
         hidden_dim=args.hidden_dim,
         nhead=args.nhead,
         num_encoder_layers=args.num_encoder_layers
     ).to(device)
 
     # 定义损失函数和优化器
-    criterion = DistillationLoss(alpha=args.alpha, T=args.temperature)
+    criterion = EnhancedLoss(
+        alpha=args.alpha,
+        T=args.temperature,
+        focal_gamma=2.0,
+        dice_weight=0.5
+    )
+
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=10, T_mult=2, eta_min=1e-6
+    )
+    grad_clip_value = 1.0  # 定义梯度裁剪值
 
     # 创建保存目录
     os.makedirs(args.save_dir, exist_ok=True)
@@ -192,7 +222,7 @@ def main(args):
 
         # 训练
         train_loss, train_bce, train_distill, train_metrics = train_one_epoch(
-            model, train_loader, criterion, optimizer, device
+            model, train_loader, criterion, optimizer, device, grad_clip_value
         )
 
         # 验证
@@ -226,6 +256,20 @@ def main(args):
             'best_val_f1': best_val_f1
         }, os.path.join(args.save_dir, 'latest_checkpoint.pth'))
 
+        scheduler.step()
+
+        # 早停检查
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), os.path.join(args.save_dir, 'best_model.pth'))
+            print(f"保存最佳模型，F1分数: {val_metrics['f1']:.4f}")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"早停：验证损失{patience}轮未改善")
+                break
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='训练变化检测模型')
@@ -241,7 +285,7 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_dim', type=int, default=256, help='Transformer隐藏维度')
     parser.add_argument('--nhead', type=int, default=8, help='注意力头数量')
     parser.add_argument('--num_encoder_layers', type=int, default=6, help='Transformer编码器层数')
-    parser.add_argument('--alpha', type=float, default=0.5, help='蒸馏损失权重')
+    parser.add_argument('--alpha', type=float, default=0.2, help='蒸馏损失权重')
     parser.add_argument('--temperature', type=float, default=2.0, help='蒸馏温度')
     parser.add_argument('--num_workers', type=int, default=4, help='数据加载的工作线程数')
 

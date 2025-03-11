@@ -61,16 +61,17 @@ class ChangeDetectionDataset(Dataset):
         # 应用变换
         if self.transform:
             t1_optical = self.transform(t1_optical)
-
-            # SAR图像特殊处理
-            t2_sar = transforms.ToTensor()(t2_sar)
-            t2_sar = transforms.Normalize(mean=[0.5], std=[0.5])(t2_sar)
-
             t2_optical = self.transform(t2_optical)
         else:
             t1_optical = transforms.ToTensor()(t1_optical)
-            t2_sar = transforms.ToTensor()(t2_sar)
             t2_optical = transforms.ToTensor()(t2_optical)
+
+        # 对SAR图像应用专用转换
+        if hasattr(self, 'sar_transform') and self.sar_transform:
+            t2_sar = self.sar_transform(t2_sar)
+        else:
+            t2_sar = transforms.ToTensor()(t2_sar)
+            t2_sar = transforms.Normalize(mean=[0.5], std=[0.5])(t2_sar)
 
         # 标签变换
         if self.label_transform:
@@ -106,22 +107,50 @@ def get_label_transform():
         binarize_label
     ])
 
+# 在dataset.py中实现
+def get_transforms(is_train=True):
+    if is_train:
+        return transforms.Compose([
+            transforms.RandomResizedCrop(256, scale=(0.8, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+            transforms.RandomAffine(degrees=10, translate=(0.1, 0.1)),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+    else:
+        return transforms.Compose([
+            transforms.Resize(256),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
+# SAR图像专用转换
+def get_sar_transforms(is_train=True):
+    if is_train:
+        return transforms.Compose([
+            transforms.RandomResizedCrop(256, scale=(0.8, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+            transforms.RandomAffine(degrees=10, translate=(0.1, 0.1)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5], std=[0.5])  # SAR图像标准化
+        ])
+    else:
+        return transforms.Compose([
+            transforms.Resize(256),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5], std=[0.5])
+        ])
 
 def create_dataloaders(args):
-    """
-    创建训练和验证数据加载器
-
-    参数:
-        args: 命令行参数
-
-    返回:
-        train_loader, val_loader: 训练和验证数据加载器
-    """
+    """创建训练和验证数据加载器"""
     # 默认路径设置
     default_train_dir = "./data/train"
     default_val_dir = "./data/val"
 
-    # 优先使用命令行参数，如果没有则使用默认设置
+    # 优先使用命令行参数
     train_dir = args.train_dir if hasattr(args, 'train_dir') and args.train_dir else default_train_dir
     val_dir = args.val_dir if hasattr(args, 'val_dir') and args.val_dir else default_val_dir
     batch_size = args.batch_size if hasattr(args, 'batch_size') else 4
@@ -130,21 +159,32 @@ def create_dataloaders(args):
     print(f"使用训练数据目录: {train_dir}")
     print(f"使用验证数据目录: {val_dir}")
 
-    transform = get_transforms()
+    # 使用增强的数据转换
+    optical_transform_train = get_transforms(is_train=True)
+    optical_transform_val = get_transforms(is_train=False)
+    sar_transform_train = get_sar_transforms(is_train=True)
+    sar_transform_val = get_sar_transforms(is_train=False)
     label_transform = get_label_transform()
 
+    # 创建训练数据集
     train_dataset = ChangeDetectionDataset(
         root_dir=train_dir,
-        transform=transform,
+        transform=optical_transform_train,  # 光学图像使用普通转换
         label_transform=label_transform
     )
 
+    # 创建验证数据集
     val_dataset = ChangeDetectionDataset(
         root_dir=val_dir,
-        transform=transform,
+        transform=optical_transform_val,
         label_transform=label_transform
     )
 
+    # 将SAR转换函数传递给数据集
+    train_dataset.sar_transform = sar_transform_train
+    val_dataset.sar_transform = sar_transform_val
+
+    # 创建数据加载器
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -162,6 +202,7 @@ def create_dataloaders(args):
     )
 
     return train_loader, val_loader
+
 
 
 # 测试代码
