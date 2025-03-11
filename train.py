@@ -26,7 +26,9 @@ class EnhancedLoss(nn.Module):
 
     def focal_loss(self, pred, target):
         """Focal Loss - 更好地处理类别不平衡"""
-        bce = F.binary_cross_entropy(pred, target, reduction='none')
+        pos_weight = torch.ones_like(target) * 15.0  # 正样本权重设为15倍
+        weight = target * (pos_weight - 1.0) + 1.0
+        bce = F.binary_cross_entropy(pred, target, reduction='none', weight=weight)
         pt = target * pred + (1 - target) * (1 - pred)
         focal_weight = (1 - pt) ** self.focal_gamma
         return (focal_weight * bce).mean()
@@ -340,9 +342,9 @@ if __name__ == '__main__':
 
     # 其他训练参数
     parser.add_argument('--save_dir', type=str, default='./checkpoints', help='保存模型检查点的目录')
-    parser.add_argument('--batch_size', type=int, default=16, help='批次大小')
+    parser.add_argument('--batch_size', type=int, default=32, help='批次大小')
     parser.add_argument('--epochs', type=int, default=100, help='训练轮次')
-    parser.add_argument('--lr', type=float, default=1e-4, help='学习率')
+    parser.add_argument('--lr', type=float, default=5e-5, help='学习率')
     parser.add_argument('--hidden_dim', type=int, default=256, help='Transformer隐藏维度')
     parser.add_argument('--nhead', type=int, default=8, help='注意力头数量')
     parser.add_argument('--num_encoder_layers', type=int, default=6, help='Transformer编码器层数')
