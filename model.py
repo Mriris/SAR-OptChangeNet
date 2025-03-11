@@ -120,11 +120,11 @@ class ImprovedTransformerChangeDetection(nn.Module):
 
         # 特征提取器
         self.branch1_encoder = self._build_optical_encoder()  # 时间点1的光学图像
-        self.branch2_encoder = self._build_sar_encoder()  # 时间点2的SAR图像 (学生)
-        self.branch3_encoder = self._build_optical_encoder()  # 时间点2的光学图像 (教师)
+        self.branch2_encoder = self._build_sar_encoder()     # 时间点2的SAR图像 (学生)
+        self.branch3_encoder = self._build_optical_encoder() # 时间点2的光学图像 (教师)
 
         # 特征投影
-        self.projection1 = nn.Conv2d(2048, hidden_dim, kernel_size=1)  # ResNet50输出2048通道
+        self.projection1 = nn.Conv2d(2048, hidden_dim, kernel_size=1)
         self.projection2 = nn.Conv2d(2048, hidden_dim, kernel_size=1)
         self.projection3 = nn.Conv2d(2048, hidden_dim, kernel_size=1)
 
@@ -141,8 +141,8 @@ class ImprovedTransformerChangeDetection(nn.Module):
         # 增强的差异特征注意力
         self.diff_attention = EnhancedDifferenceAttentionModule(hidden_dim)
 
-        # # 多尺度特征融合
-        # self.fpn = FeaturePyramidNetwork(hidden_dim)
+        # 添加通道门控注意力
+        self.channel_attention = ChannelGatedAttention(hidden_dim)
 
         # 改进的解码器
         self.decoder = DeepLabV3PlusDecoder(hidden_dim)
@@ -162,11 +162,15 @@ class ImprovedTransformerChangeDetection(nn.Module):
         diff_features = self.diff_attention(f1, f2)
         teacher_guidance = self.diff_attention(f3, f2)
 
+        # 应用通道门控注意力
+        diff_features = self.channel_attention(diff_features)
+        teacher_guidance = self.channel_attention(teacher_guidance)
+
         # 使用 BiFPN 融合特征
         fused_features = self.bifpn([diff_features, teacher_guidance, f3])
 
         # 解码
-        change_map = self.decoder(fused_features[0], teacher_guidance)  # 选择一个输出
+        change_map = self.decoder(fused_features[0], teacher_guidance)
 
         return change_map, f2, f3
 
@@ -179,11 +183,47 @@ class ImprovedTransformerChangeDetection(nn.Module):
     def _build_sar_encoder(self):
         """SAR 图像特征提取器，使用调整后的 ResNet50"""
         encoder = models.resnet50(weights="IMAGENET1K_V2")
-        # 修改输入通道为 1（SAR 图像通常为单通道）
         encoder.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+
+        # 添加SAR特定处理块
+        self.sar_specific = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+
+        # 修改前向传播
+        def forward(self, x):
+            x = encoder.conv1(x)
+            x = encoder.bn1(x)
+            x = encoder.relu(x)
+            x = self.sar_specific(x)  # 添加SAR处理
+            x = encoder.maxpool(x)
+            for layer in list(encoder.children())[4:-2]:
+                x = layer(x)
+            return x
+
         modules = list(encoder.children())[:-2]
         return nn.Sequential(*modules)
 
+
+class ChannelGatedAttention(nn.Module):
+    def __init__(self, channels):
+        super(ChannelGatedAttention, self).__init__()
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // 4, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // 4, channels, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        attention = self.gate(x)
+        return x * attention
 
 class DeepLabV3PlusDecoder(nn.Module):
     def __init__(self, in_channels, out_channels=1):
@@ -260,6 +300,19 @@ class EnhancedDifferenceAttentionModule(nn.Module):
         # 融合特征
         return self.fusion(torch.cat([attended_diff, x2], dim=1))
 
+
+class BoundaryAwareLoss(nn.Module):
+    def __init__(self, weight=1.0):
+        super(BoundaryAwareLoss, self).__init__()
+        self.weight = weight
+
+    def forward(self, pred, target):
+        laplacian_kernel = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]],
+                                        dtype=torch.float32).reshape(1, 1, 3, 3).to(pred.device)
+        boundary_target = F.conv2d(target, laplacian_kernel, padding=1)
+        boundary_pred = F.conv2d(pred, laplacian_kernel, padding=1)
+        boundary_loss = F.binary_cross_entropy(torch.sigmoid(boundary_pred), torch.sigmoid(boundary_target))
+        return self.weight * boundary_loss
 
 class DynamicWeightModule(nn.Module):
     """动态权重分配模块"""
