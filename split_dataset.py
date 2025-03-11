@@ -5,6 +5,36 @@ import shutil
 from pathlib import Path
 from tqdm import tqdm
 import glob
+import cv2
+import numpy as np
+
+
+def calculate_change_degree(base_name, input_dir):
+    """
+    计算图像对的变化程度（基于_E.png标签图像）
+
+    参数:
+        base_name: 基础文件名
+        input_dir: 输入目录
+
+    返回:
+        change_degree: 变化程度（标签图像中变化像素的数量）
+    """
+    # 加载标签图像
+    label_path = os.path.join(input_dir, f"{base_name}_E.png")
+
+    if not os.path.exists(label_path):
+        return 0
+
+    label_img = cv2.imread(label_path, cv2.IMREAD_GRAYSCALE)
+
+    if label_img is None:
+        return 0
+
+    # 计算变化像素（255）的数量
+    change_degree = np.sum(label_img == 255)
+
+    return change_degree
 
 
 def find_base_names(input_dir):
@@ -37,7 +67,7 @@ def find_base_names(input_dir):
 
 def split_dataset(input_dir, train_dir, val_dir, val_ratio=0.2, small_batch=False, small_batch_size=100, seed=42):
     """
-    将数据集分割为训练集和验证集
+    将数据集分割为训练集和验证集，优先选择变化明显的区域（基于_E.png标签，当启用小批次时）
 
     参数:
         input_dir: 输入目录，包含所有裁剪后的数据
@@ -60,19 +90,36 @@ def split_dataset(input_dir, train_dir, val_dir, val_ratio=0.2, small_batch=Fals
 
     print(f"找到 {len(base_names)} 组有效数据")
 
-    # 随机打乱数据
-    random.shuffle(base_names)
+    if small_batch:
+        # 计算每对图像的变化程度（基于_E.png）
+        change_degrees = []
+        for base_name in tqdm(base_names, desc="计算变化程度"):
+            degree = calculate_change_degree(base_name, input_dir)
+            change_degrees.append((base_name, degree))
 
-    # 计算验证集大小
-    val_size = int(len(base_names) * val_ratio)
-    if small_batch and small_batch_size < len(base_names) - val_size:
-        train_size = small_batch_size
+        # 根据变化程度降序排序
+        change_degrees.sort(key=lambda x: x[1], reverse=True)
+
+        # 分割训练集和验证集
+        train_size = min(small_batch_size, len(base_names))
+        val_size = int(len(base_names) * val_ratio)
+        if train_size + val_size > len(base_names):
+            val_size = len(base_names) - train_size
+
+        # 选择前 train_size 个作为训练集
+        train_names = [item[0] for item in change_degrees[:train_size]]
+        val_names = [item[0] for item in change_degrees[train_size:train_size + val_size]]
     else:
+        # 随机打乱数据
+        random.shuffle(base_names)
+
+        # 计算验证集大小
+        val_size = int(len(base_names) * val_ratio)
         train_size = len(base_names) - val_size
 
-    # 分割数据集
-    train_names = base_names[:train_size]
-    val_names = base_names[-val_size:] if val_size > 0 else []
+        # 分割数据集
+        train_names = base_names[:train_size]
+        val_names = base_names[-val_size:] if val_size > 0 else []
 
     print(f"分割为训练集 {len(train_names)} 组，验证集 {len(val_names)} 组")
 
